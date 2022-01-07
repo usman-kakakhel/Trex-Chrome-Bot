@@ -15,9 +15,6 @@ class Dino_env:
     def play(self):
         self.dino.play()
     
-    def close(self):
-        self.dino.close()
-    
     def getScore(self):
         return self.dino.getScore()
     
@@ -58,4 +55,4 @@ if __name__ == "__main__":
         if i %10 == 0:
             env.dino.up()
         # env.img_show.send(env.dino.screenshot())
-    env.close()
+    env.stop()

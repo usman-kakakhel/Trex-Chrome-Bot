@@ -1,199 +1,146 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Variable
-from collections import deque
 import random
-import numpy as np 
-import time
+import numpy as np
+from collections import deque
 from Dino_Chrome_env import Dino_env
-import os
-import pickle
 
-eps = 0
+import tensorflow as tf
+from tensorflow.keras import Input
+from tensorflow.keras.layers import Dense, Flatten, Conv2D, MaxPooling2D, Dropout
+from tensorflow.keras.optimizers import Nadam
+from tensorflow.keras.models import Sequential
 
-def save_obj(obj, path, name):
-    with open(path + name + '.pkl', 'wb') as f: #dump files into objects folder
-        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
-		
-def load_obj(path, name):
-    with open(path + name + '.pkl', 'rb') as f:
-        return pickle.load(f)
+def build_model(sliding_input_shape=(150,300,4)):
+	model = Sequential([
+			Input(shape=sliding_input_shape),
+			Conv2D(32, (3, 3), activation='relu', padding='same'),
+			MaxPooling2D(),
+			Conv2D(64, (3, 3), activation='relu', padding='same'),
+			MaxPooling2D(),
+			Conv2D(128, (3, 3), activation='relu', padding='same'),
+			MaxPooling2D(),
+			Conv2D(256, (3, 3), activation='relu', padding='same'),
+			MaxPooling2D(),
+			Dropout(0.7),
+			Conv2D(512, (3, 3), activation='relu', padding='same'),
+			MaxPooling2D(),
+			Dropout(0.7),
+			Conv2D(1024, (3, 3), activation='relu', padding='same'),
+			MaxPooling2D(),
+			Dropout(0.7),
+			Flatten(),
+			Dense(512, activation='relu'),
+			Dense(64, activation="relu"),
+			Dense(8, activation="relu"),
+			Dense(2, activation="linear"),
+		])
+	nadam = Nadam(learning_rate=0.0001, beta_1=0.9, beta_2=0.999, epsilon=1e-07)
+	model.compile(optimizer=nadam, loss='mse')
+	return model
 
-def saver(state_dict, mem, itr, eps, path, toBeSaved):
-	if toBeSaved:
-		torch.save(state_dict, path + "model.pt")
-		save_obj(mem, path, 'mem')
-		save_obj(itr, path, 'itr')
-		save_obj(eps, path, 'eps')
-
-def loader(path):
-	if os.path.exists(path + "model.pt"):
-		state_dict = torch.load(path + "model.pt")
-	else:
-		state_dict = None
-	if os.path.exists(path + "mem.pkl"):
-		mem = load_obj(path, 'mem')
-	else:
-		maxBufferSize=100000
-		mem = deque(maxlen=maxBufferSize)
-	if os.path.exists(path + "itr.pkl"):
-		itr = load_obj(path, 'itr')
-	else:
-		itr = 0
-	if os.path.exists(path + "eps.pkl"):
-		eps = load_obj(path, 'eps')
-	else:
-		eps = 0
-	return state_dict, mem, itr, eps
-
-class Brain(nn.Module):
-	def __init__(self, lr):
-		super(Brain, self).__init__()
-		self.h1 = nn.Conv2d(4, 32, 8, 4)
-		self.pool1 = nn.MaxPool2d(2)
-		self.h2 = nn.Conv2d(32, 64, 4, 1)
-		self.h3 = nn.Conv2d(64, 64, 3, 1)
-		self.h4 = nn.Linear(1600, 256)
-		self.h5 = nn.Linear(256 , 2)
-		self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-		self.lossFunc = nn.MSELoss()
-		self.apply(init_weights)
-	
-
-	def forward(self, x):
-		x = torch.Tensor(x)
-		x = F.relu(self.h1(x))
-		x = self.pool1(x)
-		x = F.relu(self.h2(x))
-		x = F.relu(self.h3(x))
-		x = x.view(x.size()[0], -1)
-		x = F.relu(self.h4(x))
-		x = F.relu(self.h5(x))
-		return x
-
-def init_weights(m):
-    if type(m) == nn.Conv2d or type(m) == nn.Linear:
-        torch.nn.init.uniform_(m.weight, -0.01, 0.01)
-        m.bias.data.fill_(0.01)	
-
-class GameAgent():
-	def __init__(self, gamma, epsilon, alpha, batchSize, maxBufferSize=50000, minEpsilon=0.0001, decayEpsilon=0.99):
-		global eps
+class GameAgent:
+	def __init__(self, gamma=0.99, epsilon=0.5, alpha=0.9, batchSize=256, 
+				maxBufferSize=35000, minEpsilon=0.00001, decayEpsilon=0.999):
 		self.epsilon = epsilon
 		self.minEpsilon = minEpsilon
 		self.decayEpsilon = decayEpsilon
 		self.batchSize = batchSize
 		self.gamma = gamma
+		self.alpha = alpha
 		self.maxBufferSize = maxBufferSize
-		# self.memory = deque(maxlen=maxBufferSize)
-		# self.bufferItr = 0
-		self.brain = Brain(alpha)
-		state_dict, self.memory, self.bufferItr, eps = loader("Logs/")
-		if state_dict is not None:
-			self.brain.load_state_dict(state_dict)
-			self.brain.eval()
-			self.epsilon = self.minEpsilon
-		
+		self.memory = deque(maxlen=maxBufferSize)
+		self.bufferItr = 0
+		self.overflow = False
+		self.brain = build_model()
 
 	def storeMem(self, state, action, reward, nextState, done):
 		if self.bufferItr >= self.maxBufferSize:
+			self.bufferItr = 0
+			self.overflow = True
+
+		if self.overflow:
 			self.bufferItr = self.bufferItr % self.maxBufferSize
 			self.memory[self.bufferItr] = [state, action, reward, nextState, done]
 			self.bufferItr += 1
 		else:
-			self.bufferItr += 1
 			self.memory.append([state, action, reward, nextState, done])
+			self.bufferItr += 1
 
 	def act(self, state):
 		if np.random.rand(1) < self.epsilon:
+			print("rand")
 			return np.random.randint(0, 2)
 		else:
-			return self.brain.forward(state).argmax().item()
+			print("nott")
+			return tf.argmax(self.brain(state), axis=1).numpy().squeeze()
 
 	def decay(self):
 		if self.epsilon > self.minEpsilon:
-			self.epsilon -= (0.1 - 0.0001) / 100000
-			# self.epsilon = self.epsilon * self.decayEpsilon
+			self.epsilon = self.epsilon * self.decayEpsilon
 		else:
 			self.epsilon = self.minEpsilon
 
 	def train(self):
-		if len(self.memory) < 100:
+		if len(self.memory) < self.batchSize:
 			return
-		
+
 		batch = random.sample(self.memory, self.batchSize)
-		npBatch = np.array(batch)
+		npBatch = np.array(batch, dtype=object)
 
 		statesTemp, actionsTemp, rewardsTemp, newstatesTemp, donesTemp = np.hsplit(npBatch, 5)
-
 		states = np.concatenate((np.squeeze(statesTemp[:])), axis = 0)
 		newstates = np.concatenate(np.concatenate(newstatesTemp))
-
+		actions = actionsTemp.reshape(self.batchSize,).astype(int)
 		rewards = rewardsTemp.reshape(self.batchSize,).astype(float)
 		dones = np.concatenate(donesTemp).astype(bool)
 		notdones = ~dones
 		notdones = notdones.astype(float)
 		dones = dones.astype(float)
-
-		qValue = self.brain.forward(states)
-		targetQValue = qValue.clone().detach().numpy()
-		nextQValue = self.brain.forward(newstates)
-		npNextQValue = np.amax(nextQValue.clone().detach().numpy(), axis=1)
 		
-		actions = actionsTemp.reshape(self.batchSize,).astype(int)
+		qValue = self.brain(states).numpy()
+		maxCurrQValue = np.amax(qValue, axis=1)
+		maxNextQValue = np.amax(self.brain(newstates).numpy(), axis=1)
+		targetQValue = qValue.copy()
+
 		indexes = np.arange(self.batchSize)
-		targetQValue[(indexes, actions)] = rewards * dones + (rewards + npNextQValue * self.gamma) * notdones
-		targetQValue = torch.Tensor(targetQValue)
+		a = rewards * dones
+		b = (maxCurrQValue + self.alpha * (rewards + maxNextQValue * self.gamma - maxCurrQValue)) * notdones
+		targetQValue[(indexes, actions)] = a * b
 
-		self.brain.optimizer.zero_grad()
-		loss = self.brain.lossFunc(qValue, targetQValue)
-		loss.backward()
-		self.brain.optimizer.step()
-		
-myEnv = Dino_env()
-dqn = GameAgent(0.99, 0.1, 0.0001, 16)
-stat_file = open("stats.txt","a")
-counter = 0
+		history = self.brain.fit(states, targetQValue, batch_size=16, epochs=1, verbose=0)
 
-myEnv.step(1)
-while True:
-	st, reward, done_ = myEnv.step(0)
-	st = np.stack((st, st, st, st), axis=0)
-	currentState = st.reshape(1, st.shape[0], st.shape[1], st.shape[2])
-	rewardSum = 0
-	curr_score = myEnv.getScore()
-	high_score = myEnv.getHighScore()
-	done = False
+if __name__ == "__main__":
+	myEnv = Dino_env()
+	dqn = GameAgent()
 
-	while not done:
-		bestAction = dqn.act(currentState)
-		new_st, reward, done = myEnv.step(bestAction)
-		new_st = new_st.reshape(1, 1, new_st.shape[0], new_st.shape[1])
-		new_state = np.append(new_st, currentState[:, 1:, :, :], axis=1)
-		if myEnv.getScore() > curr_score:
-			curr_score = myEnv.getScore()
-
-		dqn.storeMem(currentState, bestAction, reward, new_state, done)
-
-		if counter*16 >= 50000:
-			myEnv.pause()
-			saver(dqn.brain.state_dict(),dqn.memory,dqn.bufferItr, eps, "Logs/", True)
-			myEnv.play()
-			counter = 0
-		else:
-			counter += 1
-
-		dqn.train()
-		rewardSum += reward
-		currentState = new_state
-		dqn.decay()
-
-	stat_file.write(str(eps) + ", " + str(curr_score) + "\n")
-	print("Reached score: {} in episode: {} with high score: {}, epsilon: {}".format(curr_score, eps, myEnv.getHighScore(), dqn.epsilon))
-	eps += 1
-	if myEnv.getHighScore() > high_score:
+	myEnv.step(1)
+	eps = 1
+	while True:
+		st, reward, done_ = myEnv.step(0)
+		st = np.stack((st, st, st, st), axis=2)
+		currentState = st.reshape(1, st.shape[0], st.shape[1], st.shape[2])
+		rewardSum = 0
+		curr_score = myEnv.getScore()
 		high_score = myEnv.getHighScore()
-		saver(dqn.brain.state_dict(),dqn.memory,dqn.bufferItr, eps, "Logs/best/", True)
+		done = False
 
-myEnv.stop()
+		while not done:
+			bestAction = dqn.act(currentState)
+			new_st, reward, done = myEnv.step(bestAction)
+			new_st = new_st.reshape(1, new_st.shape[0], new_st.shape[1], 1)
+			new_state = np.append(currentState[:, :, :, 1:], new_st, axis=3)
+			if myEnv.getScore() > curr_score:
+				curr_score = myEnv.getScore()
+
+			dqn.storeMem(currentState, bestAction, reward, new_state, done)
+
+			dqn.train()
+			rewardSum += reward
+			currentState = new_state
+			dqn.decay()
+
+		print("Reached score: {} in episode: {} with high score: {}, epsilon: {}".format(curr_score, eps, myEnv.getHighScore(), dqn.epsilon))
+		eps += 1
+		if myEnv.getHighScore() > high_score:
+			high_score = myEnv.getHighScore()
+
+	myEnv.stop()
